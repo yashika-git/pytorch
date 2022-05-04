@@ -12,6 +12,14 @@ from .quantization_mappings import (
 from torch.ao.quantization.qconfig import QConfigAny
 
 
+# TODO: replace all usages with these constants
+GLOBAL_DICT_KEY = ""
+OBJECT_TYPE_DICT_KEY = "object_type"
+MODULE_NAME_REGEX_DICT_KEY = "module_name_regex"
+MODULE_NAME_DICT_KEY = "module_name"
+MODULE_NAME_OBJECT_TYPE_ORDER_DICT_KEY = "module_name_object_type_order"
+
+
 def get_object_type_qconfig(
         qconfig_dict: Any,
         object_type: Union[Callable, str],
