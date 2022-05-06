@@ -128,6 +128,7 @@ ALLOW_LIST = [
     ("aten::nansum", datetime.date(2022, 5, 15)),
     ("aten::zero", datetime.date(2022, 5, 15)),
     ("aten::_validate_sparse_compressed_tensor_args", datetime.date(2022, 5, 15)),
+    ("quantized::layer_norm", datetime.date(2022, 6, 1)),
 ]
 
 ALLOW_LIST_COMPILED = [
