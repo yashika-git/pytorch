@@ -12,7 +12,7 @@ from torch import sym_float, sym_int
 
 from .. import config, variables
 from ..allowed_functions import is_allowed
-from ..exc import unimplemented, Unsupported
+from ..exc import unimplemented, Unsupported, UserError, UserErrorType
 from ..guards import GuardBuilder
 from ..replay_record import DummyModule
 from ..source import AttrSource, is_constant_source, SuperSource, TypeSource
@@ -24,9 +24,15 @@ from ..utils import (
     specialize_args_kwargs,
 )
 from .base import MutableLocal, typestr, VariableTracker
-from .constant import ConstantVariable
+from .constant import ConstantVariable, EnumVariable
 from .dicts import ConstDictVariable
-from .lists import BaseListVariable, ListVariable, TupleVariable
+from .lists import (
+    BaseListVariable,
+    ListIteratorVariable,
+    ListVariable,
+    TupleIteratorVariable,
+    TupleVariable,
+)
 from .tensor import FakeItemVariable, SymNodeVariable, UnspecializedPythonVariable
 from .user_defined import UserDefinedVariable
 
@@ -355,7 +361,7 @@ class BuiltinVariable(VariableTracker):
             return None
 
         # Return first handler that matches the type checks
-        for ((type1, type2), handler) in handlers[op]:
+        for (type1, type2), handler in handlers[op]:
             if isinstance(a, type1) and isinstance(b, type2):
                 return handler
 
@@ -577,6 +583,14 @@ class BuiltinVariable(VariableTracker):
                 ),
                 **options,
             )
+
+        if self.fn is round:
+            if len(args) > 0 and isinstance(args[0], SymNodeVariable):
+                raise UserError(
+                    UserErrorType.STANDARD_LIBRARY,
+                    "Calling round() on symbolic value is not supported. "
+                    "You can use floor() to implement this functionality",
+                )
         return super().call_function(tx, args, kwargs)
 
     def _call_min_max(self, tx, *args):
@@ -607,7 +621,7 @@ class BuiltinVariable(VariableTracker):
                 a = variables.TorchVariable(torch.tensor).call_function(tx, [a], {})
 
             # Dynamic input does not get resolved, rather, gets stored as call_function
-            if isinstance(a, SymNodeVariable):
+            if isinstance(a, SymNodeVariable) or isinstance(b, SymNodeVariable):
                 from .builder import wrap_fx_proxy
 
                 return wrap_fx_proxy(
@@ -641,7 +655,6 @@ class BuiltinVariable(VariableTracker):
                 )
                 for i in [a, b]
             ):
-
                 if any([isinstance(val, FakeItemVariable) for val in [a, b]]):
                     return variables.FakeItemVariable.from_tensor_variable(result)
 
@@ -678,7 +691,6 @@ class BuiltinVariable(VariableTracker):
             )
             return SymNodeVariable.create(tx, proxy, None)
         else:
-
             unimplemented(f"unsupported min / max over args {str(a)}, {str(b)}")
 
     call_min = _call_min_max
@@ -734,7 +746,10 @@ class BuiltinVariable(VariableTracker):
         elif obj.has_unpack_var_sequence(tx):
             guards = set()
             if obj.source and not is_constant_source(obj.source):
-                guards.add(obj.source.make_guard(GuardBuilder.LIST_LENGTH))
+                if isinstance(obj, TupleIteratorVariable):
+                    guards.add(obj.source.make_guard(GuardBuilder.TUPLE_ITERATOR_LEN))
+                else:
+                    guards.add(obj.source.make_guard(GuardBuilder.LIST_LENGTH))
             return cls(
                 list(obj.unpack_var_sequence(tx)),
                 mutable_local=MutableLocal(),
@@ -746,19 +761,61 @@ class BuiltinVariable(VariableTracker):
     call_list = _call_iter_tuple_list
 
     @staticmethod
-    def call_dict_helper(user_cls, arg):
-        if arg is None:
-            return variables.ConstDictVariable(
-                {}, user_cls, mutable_local=MutableLocal()
+    def is_supported_call_dict_arg(tx, arg):
+        return (
+            arg is None
+            or isinstance(arg, ConstDictVariable)
+            or (
+                isinstance(
+                    arg,
+                    (
+                        ListVariable,
+                        TupleVariable,
+                        ListIteratorVariable,
+                    ),
+                )
+                and all(
+                    isinstance(x, (ListVariable, TupleVariable))
+                    and isinstance(
+                        x.unpack_var_sequence(tx)[0], (ConstantVariable, EnumVariable)
+                    )
+                    for x in arg.unpack_var_sequence(tx)
+                )
             )
+        )
+
+    @staticmethod
+    def call_dict_helper(tx, user_cls, arg, **options):
+        if arg is None:
+            return ConstDictVariable(
+                {}, user_cls, mutable_local=MutableLocal()
+            ).add_options(options)
         elif isinstance(arg, variables.ConstDictVariable):
-            return arg.clone(user_cls=user_cls, mutable_local=MutableLocal())
+            return arg.clone(
+                user_cls=user_cls, mutable_local=MutableLocal()
+            ).add_options(options)
+        elif isinstance(
+            arg,
+            (
+                ListVariable,
+                TupleVariable,
+                ListIteratorVariable,
+            ),
+        ):
+            items = user_cls()
+            for x in arg.unpack_var_sequence(tx):
+                k = x.unpack_var_sequence(tx)[0].as_python_constant()
+                v = x.unpack_var_sequence(tx)[1]
+                items.update({k: v})
+            return ConstDictVariable(
+                items, user_cls, mutable_local=MutableLocal()
+            ).add_options(options)
         else:
             raise AssertionError("call_dict_helper with illegal arg")
 
     def call_dict(self, tx, obj=None):
-        if obj is None or isinstance(obj, variables.ConstDictVariable):
-            return self.call_dict_helper(dict, obj)
+        if self.is_supported_call_dict_arg(tx, obj):
+            return self.call_dict_helper(tx, dict, obj)
 
     def call_zip(self, tx, *args):
         options = VariableTracker.propagate(self, args)
@@ -1026,7 +1083,11 @@ class BuiltinVariable(VariableTracker):
                 self, obj
             )
 
-        unimplemented(f"type({obj})")
+        raise UserError(
+            UserErrorType.ANTI_PATTERN,
+            "Can't call type() on generated custom object. "
+            "Please use __class__ instead",
+        )
 
     def call_reversed(self, tx, obj: VariableTracker):
         if obj.has_unpack_var_sequence(tx):
@@ -1081,6 +1142,17 @@ class BuiltinVariable(VariableTracker):
             return variables.TupleVariable(
                 items, **VariableTracker.propagate(self, iterable, *args)
             )
+
+    # neg is a constant fold function, so we only get here if constant fold is not valid
+    def call_neg(self, tx, a):
+        if isinstance(a, SymNodeVariable):
+            return SymNodeVariable.create(
+                tx,
+                (operator.neg)(a.as_proxy()),
+                sym_num=None,
+            )
+        # None no-ops this handler and lets the driving function proceed
+        return None
 
     def call_id(self, tx, *args):
         if len(args) > 0 and isinstance(args[0], variables.NNModuleVariable):

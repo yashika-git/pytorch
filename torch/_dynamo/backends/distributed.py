@@ -6,7 +6,7 @@ from typing import Any, List, Optional
 import torch
 from torch import fx
 from torch._dynamo.output_graph import GraphCompileReason
-from torch._dynamo.utils import deepcopy_to_fake_tensor, fake_mode_from_tensors
+from torch._dynamo.utils import deepcopy_to_fake_tensor, detect_fake_mode
 from torch.fx.node import Node
 
 log = logging.getLogger(__name__)
@@ -45,9 +45,11 @@ def pretty_print_buckets(buckets: List[Bucket]):
     try:
         from tabulate import tabulate
 
+        # TODO: Do you really want to log.info this?  It would get
+        # suppressed if log level is too low
         log.info(
-            "\nDDPOptimizer bucket assignments\n"
-            + tabulate(rows, headers=headers, tablefmt="simple_grid")
+            "\nDDPOptimizer bucket assignments\n%s",
+            tabulate(rows, headers=headers, tablefmt="simple_grid"),
         )
     except ImportError:
         log.info(
@@ -147,7 +149,7 @@ class DDPOptimizer:
         to compile each subgraph. Finally, stiches compiled graphs into one graphmodule
         and returns its callable.
         """
-        fake_mode = fake_mode_from_tensors(example_inputs)
+        fake_mode = detect_fake_mode(example_inputs)
         if fake_mode is None:
             fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
 
@@ -166,10 +168,9 @@ class DDPOptimizer:
 
             if node.op == "call_module":
                 target = gm.get_submodule(node.target)
-                for name, p in target.named_parameters():
-                    param = target.get_parameter(name)
-                    if p.requires_grad and not self._ignore_parameter(param):
-                        buckets[0].size += p.untyped_storage().nbytes()
+                for name, param in target.named_parameters():
+                    if param.requires_grad and not self._ignore_parameter(param):
+                        buckets[0].size += param.untyped_storage().nbytes()
                         buckets[0].params.append(f"{node.target}_{name}")
                         buckets[0].param_ids.append(id(param))
             elif node.op == "get_attr":
@@ -319,9 +320,7 @@ class DDPOptimizer:
                         else:
                             curr_submod = real_mod
 
-                        log.debug(
-                            f"\n---{n.target} graph---\n" + str(curr_submod.graph)
-                        )
+                        log.debug(f"\n---{n.target} graph---\n{curr_submod.graph}")
 
                         # When calling the compiler on the submod, inputs (new_args) are expected to
                         # be FakeTensors already since Dynamo would have made them FakeTensors in the
@@ -349,5 +348,5 @@ class DDPOptimizer:
         submod_compiler.run(*example_inputs)
         split_gm.recompile()
 
-        log.debug("\n---final graph---\n" + str(split_gm.graph) + "\n---------------\n")
+        log.debug(f"\n---final graph---\n{split_gm.graph}\n---------------\n")
         return split_gm

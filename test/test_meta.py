@@ -605,7 +605,6 @@ meta_function_expected_failures = {
     torch.Tensor.nonzero : {f64, i32, c128, i64, i16, c32, f16, u8, c64, bf16, b8, i8, f32},
     torch.ormqr : {f64, c64, c128, f32},
     torch.repeat_interleave : {f64, i32, c128, i64, i16, c32, f16, u8, c64, bf16, b8, i8, f32},
-    torch.take : {f64, i32, c128, i64, i16, f16, u8, c64, bf16, b8, i8, f32},
     torch.Tensor.item : {f64, i32, c128, i64, i16, f16, u8, c64, bf16, b8, i8, f32},
     torch.bincount : {i32, i64, u8, i16, i8},
     torch.frexp : {f64, f16, bf16, f32},
@@ -845,8 +844,6 @@ meta_dispatch_expected_failures = {
     aten.ormqr.default : {c64, c128, f64, f32},
     aten.ormqr.out : {c64, c128, f64, f32},
     aten.polar.out : {f32, f64},
-    aten.take.default : {c64, f16, i8, f64, c128, i64, bf16, f32, i32, b8, i16, u8},
-    aten.take.out : {c64, f16, i8, f64, c128, i64, bf16, f32, i32, b8, i16, u8},
     aten.tensordot.out : {c64, i8, f64, c128, i64, bf16, f32, i32, i16, u8},
     aten.to_sparse.default : {c64, f16, i8, f64, c128, i64, bf16, f32, i32, b8, i16, u8},
     aten.to_sparse.sparse_dim : {c64, f16, i8, f64, c128, i64, bf16, f32, i32, b8, i16, u8},
@@ -1110,6 +1107,28 @@ class TestMeta(TestCase):
                 if isinstance(expected, torch.Tensor) and op.supports_out:
                     func(*args, **kwargs, out=expected)
 
+            # Special test for functions taking "device" kwarg
+            # The crossref tests that replacing the device with "meta" works
+            # This part makes sure that *_like functions work well with a "meta"
+            # Tensor and their original device argument.
+            if "device" in kwargs and "_like" in op.name:
+                with torch.random.fork_rng():
+                    torch.manual_seed(123)
+                    ref = func(*args, **kwargs)
+
+                # *_like functions take a Tensor as first argument
+                assert isinstance(args[0], torch.Tensor)
+                with torch.random.fork_rng():
+                    torch.manual_seed(123)
+                    args[0] = args[0].to(device="meta")
+                    meta = func(*args, **kwargs)
+
+                # empty_like is not deterministic
+                if op.name != "empty_like":
+                    self.assertEqual(ref, meta)
+
+
+
     @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
     @skipIfCrossRef
     @suppress_warnings
@@ -1219,6 +1238,11 @@ class TestMeta(TestCase):
 
     def test_empty_quantized(self):
         r = torch.empty(2 ** 52, device='meta', dtype=torch.qint8)
+        self.assertEqual(r.device.type, 'meta')
+
+    def test_nan_to_num(self):
+        t = torch.tensor([float('nan'), float('inf'), -float('inf'), 3.14], device='meta')
+        r = t.nan_to_num()
         self.assertEqual(r.device.type, 'meta')
 
     @onlyCPU
